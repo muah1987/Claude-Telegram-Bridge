@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python3 ~/.claude-telegram/hooks/pre_tool.py"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "python3 ~/.claude-telegram/hooks/post_tool.py"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ~/.claude-telegram/hooks/stop.py"
+      }
+    ],
+    "Notification": [
+      {
+        "type": "command",
+        "command": "python3 ~/.claude-telegram/hooks/notification.py"
+      }
+    ]
+  }
+}

@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+claude-tg — Claude Code CLI wrapper with Telegram integration
+
+Usage:
+  claude-tg                          Start new session in current directory
+  claude-tg --resume <session-id>    Resume existing session
+  claude-tg --setup                  Interactive setup wizard
+  claude-tg --daemon                 Start/restart the background daemon
+  claude-tg --status                 Show daemon and session status
+  claude-tg --list                   List all sessions
+  claude-tg --alias <name>           Set alias for current session
+  claude-tg --stop-daemon            Stop the background daemon
+  claude-tg -- [claude args...]      Pass extra args to claude CLI
+
+The wrapper:
+1. Ensures the daemon is running
+2. Registers a new session (or resumes) via IPC
+3. Sets CLAUDE_TG_SESSION_ID environment variable
+4. Launches `claude` with all hooks active
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+CLAUDE_TG_DIR = Path.home() / ".claude-telegram"
+CONFIG_PATH   = CLAUDE_TG_DIR / "config.json"
+SOCKET_PATH   = CLAUDE_TG_DIR / "daemon.sock"
+PID_PATH      = CLAUDE_TG_DIR / "daemon.pid"
+DAEMON_LOG    = CLAUDE_TG_DIR / "daemon.log"
+DAEMON_SRC    = Path(__file__).parent.parent / "src" / "daemon.py"
+
+HOOKS_DIR  = Path(__file__).parent.parent / "src" / "hooks"
+CLAUDE_CFG = Path.home() / ".claude"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IPC helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+def ipc_send(payload: dict, expect_reply: bool = True) -> dict:
+    """Send JSON to daemon socket, return parsed reply."""
+    for attempt in range(3):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(5)
+                s.connect(str(SOCKET_PATH))
+                s.sendall(json.dumps(payload).encode())
+                if expect_reply:
+                    reply = s.recv(4096)
+                    return json.loads(reply) if reply else {}
+                return {}
+        except (ConnectionRefusedError, FileNotFoundError):
+            if attempt < 2:
+                time.sleep(0.5)
+    raise RuntimeError("Cannot connect to daemon. Is it running?")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Daemon management
+# ═══════════════════════════════════════════════════════════════════════════════
+def daemon_running() -> bool:
+    if not PID_PATH.exists():
+        return False
+    pid = int(PID_PATH.read_text().strip())
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def start_daemon():
+    if daemon_running():
+        print("✅ Daemon is al actief.")
+        return
+
+    if not DAEMON_SRC.exists():
+        # Try installed location
+        import shutil
+        daemon_exec = shutil.which("claude-tg-daemon")
+        if not daemon_exec:
+            print(f"❌ daemon.py niet gevonden op {DAEMON_SRC}")
+            sys.exit(1)
+        cmd = [sys.executable, daemon_exec]
+    else:
+        cmd = [sys.executable, str(DAEMON_SRC)]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=open(DAEMON_LOG, "a"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    # Wait for socket to appear
+    for _ in range(20):
+        time.sleep(0.3)
+        if SOCKET_PATH.exists() and daemon_running():
+            print(f"🚀 Daemon gestart (PID {proc.pid})")
+            return
+    print("⚠️  Daemon start timeout. Bekijk:", DAEMON_LOG)
+
+
+def stop_daemon():
+    if not PID_PATH.exists():
+        print("Daemon draait niet.")
+        return
+    pid = int(PID_PATH.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        PID_PATH.unlink(missing_ok=True)
+        print(f"🛑 Daemon (PID {pid}) gestopt.")
+    except ProcessLookupError:
+        print("Daemon was al gestopt.")
+        PID_PATH.unlink(missing_ok=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Setup wizard
+# ═══════════════════════════════════════════════════════════════════════════════
+def setup_wizard():
+    print("═" * 55)
+    print("  Claude Telegram Bridge — Setup")
+    print("═" * 55)
+    print()
+    print("Je hebt nodig:")
+    print("  1. Een Telegram Bot Token (via @BotFather)")
+    print("  2. Jouw Telegram User ID (via @userinfobot)")
+    print()
+
+    token = input("Bot Token: ").strip()
+    if not re.match(r"\d+:.+", token):
+        print("❌ Ongeldig token formaat.")
+        sys.exit(1)
+
+    user_id = input("Jouw Telegram User ID: ").strip()
+    try:
+        user_id = int(user_id)
+    except ValueError:
+        print("❌ User ID moet een getal zijn.")
+        sys.exit(1)
+
+    CLAUDE_TG_DIR.mkdir(exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps({
+        "telegram_token":   token,
+        "telegram_user_id": user_id,
+    }, indent=2))
+    print(f"\n✅ Config opgeslagen: {CONFIG_PATH}")
+
+    # Install hooks
+    install_hooks()
+    print("\n🚀 Start de daemon met: claude-tg --daemon")
+    print("📱 Start een sessie met: claude-tg")
+
+
+def install_hooks():
+    """Merge hook config into ~/.claude/settings.json"""
+    CLAUDE_CFG.mkdir(exist_ok=True)
+    settings_path = CLAUDE_CFG / "settings.json"
+
+    settings = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            pass
+
+    def hook_entry(script: str) -> dict:
+        return {"type": "command", "command": f"{sys.executable} {script}"}
+
+    pre_hook  = str(HOOKS_DIR / "pre_tool.py")
+    post_hook = str(HOOKS_DIR / "post_tool.py")
+    stop_hook = str(HOOKS_DIR / "stop.py")
+    notif_hook= str(HOOKS_DIR / "notification.py")
+
+    hooks = settings.setdefault("hooks", {})
+    # Append without duplicating
+    for event, path in [
+        ("PreToolUse",   pre_hook),
+        ("PostToolUse",  post_hook),
+        ("Stop",         stop_hook),
+        ("Notification", notif_hook),
+    ]:
+        entry = hook_entry(path)
+        if event not in hooks:
+            hooks[event] = []
+        existing_cmds = [h.get("command") for h in hooks[event]]
+        if entry["command"] not in existing_cmds:
+            hooks[event].append(entry)
+
+    settings_path.write_text(json.dumps(settings, indent=2))
+    print(f"✅ Hooks geregistreerd in {settings_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session start / resume
+# ═══════════════════════════════════════════════════════════════════════════════
+def start_session(
+    resume_id: str = None,
+    alias: str = None,
+    extra_claude_args: list = None,
+    chat_id: int = None,
+):
+    # Load config for chat_id
+    if not CONFIG_PATH.exists():
+        print("❌ Niet geconfigureerd. Run: claude-tg --setup")
+        sys.exit(1)
+
+    cfg = json.loads(CONFIG_PATH.read_text())
+    if chat_id is None:
+        chat_id = cfg.get("default_chat_id", cfg["telegram_user_id"])
+
+    # Ensure daemon running
+    if not daemon_running():
+        print("🔄 Daemon starten…")
+        start_daemon()
+
+    project_dir = str(Path.cwd())
+
+    if resume_id:
+        # Resume existing session
+        ipc_send({
+            "type":       "session_resume",
+            "session_id": resume_id,
+            "project_dir": project_dir,
+        }, expect_reply=False)
+        session_id = resume_id
+        print(f"🔄 Sessie hervat: {session_id}")
+    else:
+        # Create new session
+        reply = ipc_send({
+            "type":        "session_start",
+            "project_dir": project_dir,
+            "chat_id":     chat_id,
+            "alias":       alias,
+        })
+        session_id = reply.get("session_id")
+        if not session_id:
+            print("❌ Kon geen sessie aanmaken.")
+            sys.exit(1)
+        print(f"🟢 Sessie gestart: {session_id}")
+
+    print(f"📱 Telegram notificatie verzonden")
+    print(f"💡 Stuur @{session_id} in Telegram bij meerdere sessies\n")
+
+    # Launch claude with hooks env
+    env = {
+        **os.environ,
+        "CLAUDE_TG_SESSION_ID": session_id,
+        "CLAUDE_TG_ACTIVE":     "1",
+    }
+
+    claude_cmd = ["claude"] + (extra_claude_args or [])
+    if resume_id:
+        # Only add --resume if not already in args
+        if "--resume" not in claude_cmd and "-r" not in claude_cmd:
+            claude_cmd += ["--resume", resume_id]
+
+    try:
+        proc = subprocess.run(claude_cmd, env=env)
+    except FileNotFoundError:
+        print("❌ `claude` CLI niet gevonden. Installeer Claude Code CLI.")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+
+    # Session ended → notify daemon
+    ipc_send({
+        "type":       "session_stop",
+        "session_id": session_id,
+        "reason":     "user_exit",
+    }, expect_reply=False)
+    print(f"\n🔴 Sessie {session_id} beëindigd.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Status / list
+# ═══════════════════════════════════════════════════════════════════════════════
+def show_status():
+    print(f"Daemon: {'✅ Actief' if daemon_running() else '❌ Niet actief'}")
+    if not SOCKET_PATH.exists():
+        return
+    try:
+        # List all sessions via IPC (not yet implemented for simplicity)
+        # For now, read DB directly
+        import sqlite3
+        db_path = CLAUDE_TG_DIR / "sessions.db"
+        if not db_path.exists():
+            print("Geen sessies.")
+            return
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM sessions WHERE status='active' ORDER BY updated_at DESC"
+        ).fetchall()
+        if not rows:
+            print("Geen actieve sessies.")
+            return
+        print(f"\n{'ID':10} {'ALIAS':15} {'DIR':35} {'BIJGEWERKT':20}")
+        print("─" * 82)
+        for r in rows:
+            alias = r["alias"] or "-"
+            d     = r["project_dir"]
+            if len(d) > 33:
+                d = "…" + d[-32:]
+            print(f"{r['id']:10} {alias:15} {d:35} {str(r['updated_at'])[:16]:20}")
+    except Exception as e:
+        print(f"Fout: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(
+        prog="claude-tg",
+        description="Claude Code CLI met Telegram integratie",
+        add_help=False,
+    )
+    parser.add_argument("--setup",       action="store_true")
+    parser.add_argument("--daemon",      action="store_true")
+    parser.add_argument("--stop-daemon", action="store_true")
+    parser.add_argument("--status",      action="store_true")
+    parser.add_argument("--list",        action="store_true")
+    parser.add_argument("--resume",      metavar="SESSION_ID")
+    parser.add_argument("--alias",       metavar="NAAM")
+    parser.add_argument("--chat-id",     metavar="ID", type=int)
+    parser.add_argument("--help", "-h",  action="store_true")
+    # Everything after -- goes to claude
+    try:
+        idx = sys.argv.index("--")
+        own_args  = sys.argv[1:idx]
+        pass_args = sys.argv[idx+1:]
+    except ValueError:
+        own_args  = sys.argv[1:]
+        pass_args = []
+
+    args, unknown = parser.parse_known_args(own_args)
+    pass_args = unknown + pass_args
+
+    if args.help:
+        parser.print_help()
+        print(__doc__)
+        sys.exit(0)
+
+    if args.setup:
+        setup_wizard()
+    elif args.daemon:
+        start_daemon()
+    elif args.stop_daemon:
+        stop_daemon()
+    elif args.status or args.list:
+        show_status()
+    else:
+        start_session(
+            resume_id=args.resume,
+            alias=args.alias,
+            extra_claude_args=pass_args or None,
+            chat_id=args.chat_id,
+        )
+
+
+if __name__ == "__main__":
+    main()
