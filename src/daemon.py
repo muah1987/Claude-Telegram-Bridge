@@ -11,7 +11,6 @@ import os
 import re
 import signal
 import sqlite3
-import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -74,7 +73,7 @@ class SessionStore:
         """)
         self.db.commit()
 
-    def create(self, project_dir: str, chat_id: int, alias: str = None) -> str:
+    def create(self, project_dir: str, chat_id: int, alias: Optional[str] = None) -> str:
         sid = str(uuid.uuid4())[:8]
         self.db.execute(
             "INSERT INTO sessions (id,alias,project_dir,chat_id) VALUES (?,?,?,?)",
@@ -239,7 +238,6 @@ class IPCServer:
             alias       = msg.get("alias")
             new_sid     = self.store.create(project_dir, chat_id, alias)
             writer.write(json.dumps({"session_id": new_sid}).encode())
-            label = f"`{alias}`" if alias else f"`{new_sid}`"
             await self.bot_send(
                 chat_id,
                 f"🟢 *Nieuwe Claude Code sessie gestart*\n"
@@ -250,7 +248,7 @@ class IPCServer:
             log.info(f"Session started: {new_sid} in {project_dir}")
 
         elif kind == "session_resume":
-            if sess:
+            if sess and isinstance(sid, str):
                 self.store.update(sid, status="active")
                 await self.bot_send(
                     sess["chat_id"],
@@ -258,7 +256,7 @@ class IPCServer:
                 )
 
         elif kind == "session_stop":
-            if sess:
+            if sess and isinstance(sid, str):
                 self.store.close(sid)
                 await self.bot_send(
                     sess["chat_id"],
@@ -267,7 +265,7 @@ class IPCServer:
 
         # ── Hook events ────────────────────────────────────────────────────
         elif kind == "pre_tool":
-            if sess:
+            if sess and isinstance(sid, str):
                 tool  = msg.get("tool", "?")
                 input_= msg.get("input", {})
                 text  = f"🔧 *[{sid}] Tool wordt uitgevoerd:* `{tool}`"
@@ -278,7 +276,7 @@ class IPCServer:
                 self.store.update(sid, last_tool=tool)
 
         elif kind == "post_tool":
-            if sess:
+            if sess and isinstance(sid, str):
                 tool   = msg.get("tool", "?")
                 output = msg.get("output", "")
                 # Truncate long output
@@ -290,7 +288,7 @@ class IPCServer:
                 )
 
         elif kind == "notification":
-            if sess:
+            if sess and isinstance(sid, str):
                 await self.bot_send(
                     sess["chat_id"],
                     f"📢 *[{sid}]* {msg.get('message', '')}",
@@ -298,7 +296,7 @@ class IPCServer:
 
         elif kind == "agent_response":
             # Full assistant response forwarded from hook
-            if sess:
+            if sess and isinstance(sid, str):
                 content = msg.get("content", "")
                 await self.bot_send(sess["chat_id"], f"🤖 *[{sid}]*\n{content}")
 
@@ -311,10 +309,9 @@ class IPCServer:
 # ═══════════════════════════════════════════════════════════════════════════════
 class TelegramBridge:
     def __init__(self, token: str, allowed_user_id: int, store: SessionStore):
-        from telegram import Bot, Update
-        from telegram.ext import (
+        from telegram.ext import (  # type: ignore[import-unresolved]
             Application, CommandHandler, MessageHandler,
-            filters, ContextTypes,
+            filters,
         )
         self.token   = token
         self.uid     = allowed_user_id
@@ -323,11 +320,14 @@ class TelegramBridge:
         self.app     = Application.builder().token(token).build()
         self._running_tasks: Dict[str, asyncio.Task] = {}
 
+        self._start_time = datetime.now()
+
         # Register handlers
         self.app.add_handler(CommandHandler("start",    self._cmd_start))
         self.app.add_handler(CommandHandler("sessions", self._cmd_sessions))
         self.app.add_handler(CommandHandler("close",    self._cmd_close))
         self.app.add_handler(CommandHandler("help",     self._cmd_help))
+        self.app.add_handler(CommandHandler("status",   self._cmd_status))
         self.app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
         )
@@ -427,6 +427,27 @@ class TelegramBridge:
             parse_mode="Markdown",
         )
 
+    async def _cmd_status(self, update, ctx):
+        if not self._auth(update):
+            return
+        chat_id  = update.effective_chat.id
+        uptime   = datetime.now() - self._start_time
+        h, m     = divmod(int(uptime.total_seconds()), 3600)
+        m, s     = divmod(m, 60)
+        sessions = self.store.active_for_chat(chat_id)
+        all_sess = self.store.all_active()
+        last     = sessions[0]["updated_at"][:16] if sessions else "—"
+        await update.message.reply_text(
+            f"📊 *Claude Telegram Bridge — Status*\n\n"
+            f"⏱ Uptime: `{h}h {m}m {s}s`\n"
+            f"🔗 Actieve sessies (deze chat): `{len(sessions)}`\n"
+            f"🌐 Actieve sessies (totaal): `{len(all_sess)}`\n"
+            f"🕒 Laatste activiteit: `{last}`\n"
+            f"🤖 Bot: @muah1987\\_bot\n"
+            f"📁 Project: `{sessions[0]['project_dir'] if sessions else '—'}`",
+            parse_mode="Markdown",
+        )
+
     # ── Incoming message ──────────────────────────────────────────────────
     async def _on_message(self, update, ctx):
         if not self._auth(update):
@@ -455,6 +476,11 @@ class TelegramBridge:
 
         # Log & run
         self.store.log_msg(sid, "user", text)
+        # Send typing indicator
+        try:
+            await self.app.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        except Exception:
+            pass
         await update.message.reply_text(f"⏳ *[{sid}]* Bezig…", parse_mode="Markdown")
 
         task = asyncio.create_task(
@@ -463,17 +489,32 @@ class TelegramBridge:
         self._running_tasks[sid] = task
 
     async def _run_and_reply(self, sid: str, sess: dict, text: str, update):
-        output, new_claude_sid = await self.runner.run(
-            message=text,
-            project_dir=sess["project_dir"],
-            claude_sess_id=sess.get("claude_sess_id"),
-        )
+        try:
+            output, new_claude_sid = await self.runner.run(
+                message=text,
+                project_dir=sess["project_dir"],
+                claude_sess_id=sess.get("claude_sess_id"),
+            )
+        except asyncio.CancelledError:
+            await self.send(update.effective_chat.id, f"🚫 *[{sid}]* Geannuleerd.")
+            return
+        except Exception as e:
+            log.error(f"Runner error for session {sid}: {e}")
+            await self.send(update.effective_chat.id,
+                f"❌ *[{sid}]* Fout bij uitvoeren:\n`{str(e)[:200]}`")
+            return
+
         # Persist updated claude session id
         if new_claude_sid and new_claude_sid != sess.get("claude_sess_id"):
             self.store.update(sid, claude_sess_id=new_claude_sid)
 
         self.store.log_msg(sid, "assistant", output)
-        await self.send(update.effective_chat.id, f"🤖 *[{sid}]*\n{output}")
+
+        # Detect error output from Claude
+        prefix = "🤖"
+        if output.startswith("❌") or output.startswith("⏱"):
+            prefix = ""
+        await self.send(update.effective_chat.id, f"{prefix} *[{sid}]*\n{output}" if prefix else output)
 
     def _parse_session_prefix(self, text: str, chat_id: int) -> tuple[Optional[str], str]:
         """
